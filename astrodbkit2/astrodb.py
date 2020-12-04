@@ -10,7 +10,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.orm.query import Query
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.engine import Engine
-from sqlalchemy import event, create_engine, Table
+from sqlalchemy import event, create_engine, Table, MetaData, Column, String, Integer, Float, Boolean, ForeignKey
 from sqlalchemy import or_, and_
 from .utils import json_serializer, get_simbad_names, deprecated_alias, datetime_json_parser
 from .spectra import load_spectrum
@@ -282,6 +282,8 @@ class Database:
         self._primary_table_key = primary_table_key
         self._foreign_key = foreign_key
 
+        self.valid_datatypes = {String: (str, float, int), Float: (float), Integer: (int), Boolean: (bool)}
+
         if len(self.metadata.tables) == 0:
             print('Database empty. Import schema (eg, from astrodbkit.schema_example import *) '
                   'and then run create_database()')
@@ -296,6 +298,8 @@ class Database:
             for k, v in column_type_overrides.items():
                 tab, col = k.split('.')
                 self.metadata.tables[tab].columns[col].type = v
+
+        self.columndefs = self.tablereader()
 
     # Generic methods
     @staticmethod
@@ -363,6 +367,15 @@ class Database:
         elif results:
             data_dict[table_name] = [self._row_cleanup(row) for row in results]
 
+    def tablereader(self):
+        columndefs = {}
+        for table in self.metadata.tables:
+            for column in self.metadata.tables[table].columns:
+                print(column.__dict__)
+                columndefs[column.name] = {"name": column.name, "table": self.metadata.tables[table].name, "datatype": column.type, "nullable": column.nullable, "foreign_keys": column.foreign_keys}
+
+        return columndefs
+
     def inventory(self, name, pretty_print=False):
         """
         Method to return a dictionary of all information for a given source, matched by name.
@@ -393,6 +406,111 @@ class Database:
             print(json.dumps(data_dict, indent=4, default=json_serializer))
 
         return data_dict
+
+    def _validator(self, inputdata, star, thecolumn):
+        validtypes = self.valid_datatypes[thecolumn["datatype"]]
+        datacol = thecolumn["name"]
+        data = inputdata[datacol][star]
+
+        # Check #1: Is the data the correct type (or null, if allowed)
+        # Check #2: If the column has a corresponding _ref column,
+        #    are both columns filled or both empty?
+        # (Only a forwards check)
+        valid = False
+        if data is not None:
+            if isinstance(data, validtypes):
+                # check that the reference column is also full
+                if f"{datacol}_ref" in self.columndefs:
+                    if inputdata[f"{datacol}_ref"][star] is not None:
+                        valid = True
+                else:
+                    valid = True
+        elif thecolumn["nullable"]:
+            # if it's null and nullable, make sure the reference column is too
+            if f"{datacol}_ref" in self.columndefs:
+                if inputdata[f"{datacol}_ref"][star] is None:
+                    valid = True
+            else:
+                valid = True
+
+        return valid
+
+    def upload(self, filename, allow_new=False, skip_errors=False):
+        # Load the file
+        inputdata = pd.read_csv(filename)
+
+        primary = self.metadata.tables[self._primary_table]
+        references = {k: self.metadata.tables[k] for k in self._reference_tables}
+
+        # Loop through every line in the input file
+        for star in range(len(inputdata)):
+            star_entry = self.session.query(primary).filter_by(target_name_std=inputdata['target_name_std'][star]).one_or_none()
+            if star_entry is None:
+                if allow_new:
+                    star_entry = primary(target_name_std=inputdata['target_name_std'][star], targ_ra=inputdata['targ_ra'][star], targ_dec=inputdata['targ_dec'][star], host_galaxy_name=inputdata['host_galaxy_name'][star])
+                    self.session.add(star_entry)
+                    self.session.commit()
+                else:
+                    msg = "Unrecognized starname {}".format(inputdata['target_name_std'][star])
+                    if skip_errors==False:
+                        raise ValueError(msg)
+                    else:
+                        print(msg)
+            # Loop through the data columns
+            for datacol in inputdata:
+                if datacol in self.columndefs:
+                    thecolumn = self.columndefs[datacol]
+                    value = inputdata[datacol][star]
+                    if value is np.nan:
+                        value = None
+                    # Validate the input data
+                    if self._validator(inputdata, datacol, star, thecolumn):
+                        insert_table = references[thecolumn["table"]]
+                        # If the data is valid: Is it being inserted somewhere other than the primary table?
+                        if thecolumn['table'] != self._primary_table:
+                            # if so, does this table have an entry for the target_id already?
+                            insert_entry = self.session.query(insert_table).filter_by(target_id=star_entry.target_id).one_or_none()
+                            if insert_entry is None:
+                                # if not, make one and commit it.
+                                insert_entry = insert_table(target_id=star_entry.target_id)
+                                self.session.add(insert_entry)
+                                self.session.commit()
+                        else:
+                            # We're inserting into the primary table
+                            insert_entry = star_entry
+                        # insert_entry now definitely points to the row we want to fill
+                        # Is this entry a foreign key?
+                        if thecolumn['foreign_keys'] != set():
+                            # If so, and there's actual data here, we need to find or make an entry in the foreign table
+                            if value is not None:
+                                print(thecolumn['foreign_keys'].__dict__)
+                                # pull out the name of the table and column; the value goes there
+                                reftable = references[thecolumn["foreign_key"].split('.')[0]]
+                                refcolumn = thecolumn["foreign_key"].split('.')[1]
+                                # construct the kwarg
+                                kwargs = {refcolumn: value}
+                                result = self.session.query(reftable).filter_by(**kwargs).one_or_none()
+                                # If there was no entry, make one
+                                if result is None:
+                                    result = reftable(**kwargs)
+                                    self.session.add(result)
+                                    self.session.commit()
+                                value = result.id
+                        setattr(star_entry, datacol, value)
+                        self.session.commit()
+                    else:
+                        msg = "Problem with datafile: {} entry {} ({}) should be {}".format(datacol, value, type(value), thecolumn['datatype'])
+                        if skip_errors==False:
+                            raise ValueError(msg)
+                        else:
+                            print(msg)
+                else:
+                    msg = "Unknown column {}".format(datacol)
+                    if skip_errors==False:
+                        raise ValueError(msg)
+                    else:
+                        print(msg)
+
 
     # Text query methods
     @deprecated_alias(format='fmt')
